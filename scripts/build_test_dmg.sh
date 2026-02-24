@@ -36,6 +36,7 @@ echo "==> Preparing app bundle"
 rm -rf "$APP_EXPORT_PATH"
 ditto --noqtn --noextattr --norsrc "$APP_PATH" "$APP_EXPORT_PATH"
 find "$APP_EXPORT_PATH" -name '._*' -delete
+find "$APP_EXPORT_PATH" -exec xattr -c {} + || true
 xattr -cr "$APP_EXPORT_PATH" || true
 dot_clean -m "$APP_EXPORT_PATH" || true
 

@@ -8,6 +8,7 @@ import QuickLook
 import ImageIO
 import WebKit
 import QuartzCore  // For CATransaction
+import QuickLookThumbnailing
 
 // MARK: - Debug Logger
 final class DebugLogger {
@@ -112,16 +113,21 @@ final class FileItem: NSObject, QLPreviewItem {
     private var _formattedDate: String?
     private var _kindDescription: String?
     private var _previewInfo: String?
+    private let fileExtension: String
     
     // Cached type checks for fast preview decisions
-    lazy var isImage: Bool = contentType?.conforms(to: .image) ?? false
-    lazy var isText: Bool = contentType?.conforms(to: .text) ?? false || url.pathExtension.lowercased() == "md"
+    private static let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "tiff", "tif", "bmp", "icns"]
+    private static let textExtensions: Set<String> = ["md", "markdown", "txt", "rtf", "json", "yaml", "yml", "xml", "log", "csv", "tsv", "swift", "sh"]
+    
+    lazy var isImage: Bool = (contentType?.conforms(to: .image) ?? false) || Self.imageExtensions.contains(fileExtension)
+    lazy var isText: Bool = (contentType?.conforms(to: .text) ?? false) || Self.textExtensions.contains(fileExtension)
     lazy var isMedia: Bool = contentType?.conforms(to: .audiovisualContent) ?? false
-    lazy var isPDF: Bool = contentType?.conforms(to: .pdf) ?? false || url.pathExtension.lowercased() == "pdf"
+    lazy var isPDF: Bool = contentType?.conforms(to: .pdf) ?? false || fileExtension == "pdf"
     
     init(url: URL, resourceValues: URLResourceValues, parent: FileItem? = nil) {
         self.url = url
         self.name = url.lastPathComponent
+        self.fileExtension = url.pathExtension.lowercased()
         self.isFolder = resourceValues.isDirectory ?? false
         self.size = Int64(resourceValues.fileSize ?? 0)
         self.modificationDate = resourceValues.contentModificationDate ?? Date()
@@ -257,6 +263,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
     private var visibleRootItems: [FileItem] = []
     private var previewedItem: FileItem?
     private var previewImageLoadTask: DispatchWorkItem?
+    private var previewFallbackTask: DispatchWorkItem?
     private var previewRootURL: URL?
     private var didSetInitialSplitPosition = false
     private var singleFileMode = false
@@ -666,9 +673,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
                 // Check if directory
                 let values = try url.resourceValues(forKeys: [.isDirectoryKey])
                 if values.isDirectory == false {
-                    // Single file mode - HELLO WORLD TEST
-                    DebugLogger.shared.log("✅ DETECTED SINGLE FILE: \(url.lastPathComponent)")
-                    NSLog("✅ PeekX: DETECTED SINGLE FILE: \(url.lastPathComponent)")
+                    DebugLogger.shared.log("Detected single file preview: \(url.lastPathComponent)")
                     
                     DispatchQueue.main.async {
                         // SINGLE FILE MODE
@@ -772,6 +777,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
                                     }
                                     pre * { background: transparent !important; }
                                     pre code { background: none; padding: 0; }
+                                    pre code, pre code * { color: inherit !important; }
                                     ul, ol { margin: 0 0 16px 0; padding-left: 32px; }
                                     li { margin: 4px 0; }
                                     blockquote {
@@ -805,6 +811,20 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
                                     const tocList = document.getElementById('toc-list');
                                     content.innerHTML = marked.parse(markdown);
                                     
+                                    const normalizeCodeBlocks = () => {
+                                        content.querySelectorAll('pre, pre *').forEach((el) => {
+                                            if (el.style) {
+                                                el.style.background = 'transparent';
+                                                el.style.backgroundColor = 'transparent';
+                                            }
+                                        });
+                                        content.querySelectorAll('pre').forEach((pre) => {
+                                            pre.style.background = 'rgba(110,118,129,0.18)';
+                                            pre.style.backgroundColor = 'rgba(110,118,129,0.18)';
+                                        });
+                                    };
+                                    normalizeCodeBlocks();
+                                    
                                     const headings = [...content.querySelectorAll('h1, h2, h3')];
                                     const usedIds = {};
                                     const slugify = (value) => {
@@ -835,8 +855,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
                             
                             DispatchQueue.main.async {
                                 self.singleFileWebView.loadHTMLString(html, baseURL: url.deletingLastPathComponent())
-                                DebugLogger.shared.log("✅ Markdown rendered for \(url.lastPathComponent)")
-                                NSLog("✅ PeekX: Markdown rendered for \(url.lastPathComponent)")
+                                DebugLogger.shared.log("Markdown rendered for \(url.lastPathComponent)")
                             }
                         }
                         
@@ -860,11 +879,13 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
                 completeOnce(nil)
 
                 let start = CFAbsoluteTimeGetCurrent()
-                let contents = try FileManager.default.contentsOfDirectory(
-                    at: url,
-                    includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentTypeKey, .contentModificationDateKey],
-                    options: [.skipsHiddenFiles]
-                )
+                let contents: [URL] = self.withSecurityScopedAccess(url) {
+                    (try? FileManager.default.contentsOfDirectory(
+                        at: url,
+                        includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentTypeKey, .contentModificationDateKey],
+                        options: [.skipsHiddenFiles]
+                    )) ?? []
+                }
                 let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
                 DebugLogger.shared.log("Enumerated \(contents.count) entries for \(url.lastPathComponent) in \(String(format: "%.1f", elapsed)) ms")
                 
@@ -1111,6 +1132,8 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
     private func updatePreview(for item: FileItem?) {
         previewImageLoadTask?.cancel()
         previewImageLoadTask = nil
+        previewFallbackTask?.cancel()
+        previewFallbackTask = nil
         previewSpinner.stopAnimation(nil)
         
         // Batch all view updates in a single transaction for better performance
@@ -1138,29 +1161,28 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         // updatePreviewPath(for: item)
         
         // Use cached type checks instead of repeated UTType conformance checks
+        webView.isHidden = true
+        previewImageView.isHidden = true
+        
         if item.isImage {
-            webView.isHidden = true
             previewImageView.isHidden = false
             loadPreviewImage(for: item)
-        } else if item.isPDF {
-            previewImageView.isHidden = true
-            webView.isHidden = false
-            previewMessageLabel.isHidden = true
-            webView.loadFileURL(item.url, allowingReadAccessTo: item.url.deletingLastPathComponent())
         } else if item.isText {
-            previewImageView.isHidden = true
             webView.isHidden = false
             previewMessageLabel.isHidden = true
             loadMarkdownPreview(for: item)
-        } else {
-            webView.isHidden = true
+        } else if item.isFolder {
             previewImageView.isHidden = false
             loadLargeIcon(for: item) { [weak self] icon in
                 guard let self, self.previewedItem === item else { return }
                 self.previewImageView.image = icon
             }
-            previewMessageLabel.stringValue = "Preview available for images, markdown, and PDF files."
+            previewMessageLabel.stringValue = "Select a file to preview."
             previewMessageLabel.isHidden = false
+        } else {
+            previewImageView.isHidden = false
+            previewMessageLabel.isHidden = true
+            loadDocumentThumbnail(for: item)
         }
     }
 
@@ -1172,12 +1194,60 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
     
     private func loadMarkdownPreview(for item: FileItem) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let text = (try? String(contentsOf: item.url, encoding: .utf8)) ?? ""
+            let text = self.withSecurityScopedAccess(item.url) {
+                (try? String(contentsOf: item.url, encoding: .utf8)) ?? ""
+            }
             let htmlBody = self.makeHTML(fromMarkdown: text)
             let template = self.makeMarkdownTemplate(htmlBody: htmlBody)
             DispatchQueue.main.async {
                 guard self.previewedItem === item else { return }
                 self.webView.loadHTMLString(template, baseURL: item.url.deletingLastPathComponent())
+            }
+        }
+    }
+    
+    private func loadDocumentThumbnail(for item: FileItem) {
+        loadLargeIcon(for: item) { [weak self] icon in
+            guard let self, self.previewedItem === item, self.previewImageView.image == nil else { return }
+            self.previewImageView.image = icon
+        }
+        
+        previewSpinner.startAnimation(nil)
+        
+        let fallback = DispatchWorkItem { [weak self] in
+            guard let self, self.previewedItem === item else { return }
+            self.previewSpinner.stopAnimation(nil)
+            self.previewMessageLabel.stringValue = "Preview unavailable for this file."
+            self.previewMessageLabel.isHidden = false
+        }
+        previewFallbackTask = fallback
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10.0, execute: fallback)
+        
+        let request = QLThumbnailGenerator.Request(
+            fileAt: item.url,
+            size: CGSize(width: 920, height: 680),
+            scale: NSScreen.main?.backingScaleFactor ?? 2.0,
+            representationTypes: .all
+        )
+        let hasAccess = item.url.startAccessingSecurityScopedResource()
+        QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { [weak self] thumbnail, _ in
+            DispatchQueue.main.async {
+                if hasAccess { item.url.stopAccessingSecurityScopedResource() }
+                guard let self, self.previewedItem === item else { return }
+                self.previewFallbackTask?.cancel()
+                self.previewFallbackTask = nil
+                self.previewSpinner.stopAnimation(nil)
+                if let cgImage = thumbnail?.cgImage {
+                    self.previewImageView.image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+                    self.previewMessageLabel.isHidden = true
+                } else {
+                    self.previewMessageLabel.stringValue = "Preview unavailable for this file."
+                    self.previewMessageLabel.isHidden = false
+                    self.loadLargeIcon(for: item) { [weak self] icon in
+                        guard let self, self.previewedItem === item else { return }
+                        self.previewImageView.image = icon
+                    }
+                }
             }
         }
     }
@@ -1283,24 +1353,25 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
             pre, code {
                 font-family: Menlo, SFMono-Regular, Consolas, monospace;
             }
-                pre {
-                    background-color: rgba(142,142,147,0.08);
-                    border: 1px solid rgba(142,142,147,0.22);
-                    padding: 12px 16px;
-                    border-radius: 8px;
+            pre {
+                background-color: rgba(142,142,147,0.08);
+                border: 1px solid rgba(142,142,147,0.22);
+                padding: 12px 16px;
+                border-radius: 8px;
                     overflow-x: auto;
-                }
-                pre * { background: transparent !important; }
-                code {
-                    background-color: rgba(142,142,147,0.2);
-                    border-radius: 4px;
-                    padding: 1px 4px;
-                }
-                pre code {
-                    background: transparent !important;
-                    padding: 0 !important;
-                    color: inherit !important;
-                }
+            }
+            pre * { background: transparent !important; }
+            code {
+                background-color: rgba(142,142,147,0.2);
+                border-radius: 4px;
+                padding: 1px 4px;
+            }
+            pre code {
+                background: transparent !important;
+                padding: 0 !important;
+                color: inherit !important;
+            }
+            pre code, pre code * { color: inherit !important; }
             table {
                 border-collapse: collapse;
                 width: 100%;
@@ -1328,6 +1399,18 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
             <article class="md-content">\(result.bodyWithAnchors)</article>
             \(tocSection)
         </div>
+        <script>
+            document.querySelectorAll('pre, pre *').forEach((el) => {
+                if (el.style) {
+                    el.style.background = 'transparent';
+                    el.style.backgroundColor = 'transparent';
+                }
+            });
+            document.querySelectorAll('pre').forEach((pre) => {
+                pre.style.background = 'rgba(110,118,129,0.18)';
+                pre.style.backgroundColor = 'rgba(110,118,129,0.18)';
+            });
+        </script>
         </body>
         </html>
         """
@@ -1420,21 +1503,40 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
     private func loadPreviewImage(for item: FileItem) {
         previewSpinner.startAnimation(nil)
         let start = CFAbsoluteTimeGetCurrent()
+        
+        let fallback = DispatchWorkItem { [weak self] in
+            guard let self, self.previewedItem === item else { return }
+            self.previewSpinner.stopAnimation(nil)
+            self.previewMessageLabel.stringValue = "Preview unavailable for this file."
+            self.previewMessageLabel.isHidden = false
+            self.loadLargeIcon(for: item) { [weak self] icon in
+                guard let self, self.previewedItem === item else { return }
+                self.previewImageView.image = icon
+            }
+        }
+        previewFallbackTask = fallback
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8.0, execute: fallback)
+        
         let fileURL = item.url as NSURL
         let task = DispatchWorkItem { [weak self] in
             guard let self else { return }
+            let hasAccess = item.url.startAccessingSecurityScopedResource()
             let source = CGImageSourceCreateWithURL(fileURL, nil)
             let cgImage = source.flatMap { CGImageSourceCreateImageAtIndex($0, 0, nil) }
+            if hasAccess { item.url.stopAccessingSecurityScopedResource() }
             DispatchQueue.main.async {
                 guard self.previewedItem === item else { return }
+                self.previewFallbackTask?.cancel()
+                self.previewFallbackTask = nil
                 self.previewSpinner.stopAnimation(nil)
                 let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
                 DebugLogger.shared.log("Preview image load for \(item.name) finished in \(String(format: "%.1f", elapsed)) ms")
                 if let cgImage {
                     let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
                     self.previewImageView.image = image
+                    self.previewMessageLabel.isHidden = true
                 } else {
-                    self.previewMessageLabel.stringValue = "Could not load image."
+                    self.previewMessageLabel.stringValue = "Preview unavailable for this file."
                     self.previewMessageLabel.isHidden = false
                     self.loadLargeIcon(for: item) { [weak self] icon in
                         guard let self, self.previewedItem === item else { return }
@@ -1539,11 +1641,13 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 let start = CFAbsoluteTimeGetCurrent()
-                let contents = try FileManager.default.contentsOfDirectory(
-                    at: item.url,
-                    includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentTypeKey, .contentModificationDateKey],
-                    options: [.skipsHiddenFiles]
-                )
+                let contents: [URL] = self.withSecurityScopedAccess(item.url) {
+                    (try? FileManager.default.contentsOfDirectory(
+                        at: item.url,
+                        includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentTypeKey, .contentModificationDateKey],
+                        options: [.skipsHiddenFiles]
+                    )) ?? []
+                }
                 let sorted = self.sortURLs(contents)
                 var children: [FileItem] = []
                 for entry in sorted.prefix(500) {
@@ -1628,6 +1732,16 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
                 completion(icon)
             }
         }
+    }
+    
+    private func withSecurityScopedAccess<T>(_ url: URL, block: () -> T) -> T {
+        let hasAccess = url.startAccessingSecurityScopedResource()
+        defer {
+            if hasAccess {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+        return block()
     }
 }
 
