@@ -50,6 +50,7 @@ iOSInjectionProject/
 test_analysis.swift
 
 *.sh
+!scripts/*.sh
 
 RELEASE_NOTES_*.md
 BUILD_GUIDE.md

@@ -50,6 +50,23 @@ PeekX enhances the macOS Quick Look feature by allowing you to preview the conte
 4. Launch PeekX once to register the Quick Look extension
 5. The app will automatically register and quit
 
+### Option 1B: No Apple Developer Account (Open Source Test Builds)
+
+For unsigned/ad-hoc builds, Quick Look extensions may not auto-register reliably on all systems.  
+Use the post-install helper after copying `PeekX.app` to `/Applications`:
+
+```bash
+/bin/bash scripts/post_install_enable.sh /Applications/PeekX.app
+```
+
+### Option 1C: Build a Reliable Test DMG (Maintainers)
+
+This project includes a packaging script that builds Release, strips problematic metadata, ad-hoc signs app+extension, and creates a test DMG:
+
+```bash
+./scripts/build_test_dmg.sh
+```
+
 ### Option 2: Build from Source
 
 ```bash
@@ -138,12 +155,16 @@ If the Quick Look extension doesn't appear after installation:
 
 1. Ensure PeekX.app is in `/Applications`
 2. Launch PeekX once to register the extension
-3. Reset Quick Look cache:
+3. Run the post-install helper:
+   ```bash
+   /bin/bash scripts/post_install_enable.sh /Applications/PeekX.app
+   ```
+4. Reset Quick Look cache:
    ```bash
    qlmanage -r cache
    killall Finder
    ```
-4. Check extension status:
+5. Check extension status:
    ```bash
    pluginkit -m -v -p com.apple.quicklook.preview | grep PeekX
    ```
@@ -207,4 +228,3 @@ Have an idea for a new feature? We'd love to hear it!
 - Label your issue with "enhancement"
 
 All feature requests are reviewed and prioritized based on community interest and feasibility.
-

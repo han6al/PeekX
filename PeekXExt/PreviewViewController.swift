@@ -117,6 +117,7 @@ final class FileItem: NSObject, QLPreviewItem {
     lazy var isImage: Bool = contentType?.conforms(to: .image) ?? false
     lazy var isText: Bool = contentType?.conforms(to: .text) ?? false || url.pathExtension.lowercased() == "md"
     lazy var isMedia: Bool = contentType?.conforms(to: .audiovisualContent) ?? false
+    lazy var isPDF: Bool = contentType?.conforms(to: .pdf) ?? false || url.pathExtension.lowercased() == "pdf"
     
     init(url: URL, resourceValues: URLResourceValues, parent: FileItem? = nil) {
         self.url = url
@@ -261,6 +262,15 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
     private var singleFileMode = false
     private var previewUpdateWorkItem: DispatchWorkItem?
     
+    private let prefs = UserDefaults.standard
+    private let defaultSplitRatio: CGFloat = 0.4
+    
+    private enum PreferenceKeys {
+        static let previewWidth = "peekx.previewWidth"
+        static let previewHeight = "peekx.previewHeight"
+        static let splitRatio = "peekx.splitRatio"
+    }
+    
     // MARK: - Formatters
     
     private lazy var byteFormatter: ByteCountFormatter = {
@@ -281,8 +291,10 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
     // MARK: - View Lifecycle
     
     override func loadView() {
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 900, height: 600))
+        let preferredSize = loadPreferredPreviewSize()
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: preferredSize.width, height: preferredSize.height))
         container.translatesAutoresizingMaskIntoConstraints = false
+        preferredContentSize = preferredSize
         
         // Main Vertical Stack
         let stack = NSStackView()
@@ -324,6 +336,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         splitView.translatesAutoresizingMaskIntoConstraints = false
         splitView.isVertical = true
         splitView.dividerStyle = .thin
+        splitView.delegate = self
         splitView.addArrangedSubview(scrollView)
         previewPane = createPreviewPane()
         splitView.addArrangedSubview(previewPane)
@@ -381,6 +394,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
     
     override func viewDidLayout() {
         super.viewDidLayout()
+        savePreferredPreviewSizeIfNeeded()
         if !didSetInitialSplitPosition {
             didSetInitialSplitPosition = true
             setDefaultSplitPosition()
@@ -410,18 +424,20 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         view.addSubview(infoLabel)
         
         NSLayoutConstraint.activate([
-            iconImageView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            iconImageView.topAnchor.constraint(equalTo: view.topAnchor),
+            iconImageView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8),
+            iconImageView.topAnchor.constraint(greaterThanOrEqualTo: view.topAnchor),
+            iconImageView.bottomAnchor.constraint(lessThanOrEqualTo: view.bottomAnchor),
+            iconImageView.centerYAnchor.constraint(equalTo: view.centerYAnchor),
             iconImageView.widthAnchor.constraint(equalToConstant: 48),
             iconImageView.heightAnchor.constraint(equalToConstant: 48),
             
             titleLabel.leadingAnchor.constraint(equalTo: iconImageView.trailingAnchor, constant: 12),
             titleLabel.topAnchor.constraint(equalTo: view.topAnchor, constant: 4),
-            titleLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            titleLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
             
             infoLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             infoLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 2),
-            infoLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            infoLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
             infoLabel.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -4)
         ])
         
@@ -455,7 +471,9 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         guard totalWidth > 0 else { return }
         let previewMin: CGFloat = 360
         let outlineMin: CGFloat = 320
-        let desiredLeft = max(outlineMin, min(totalWidth - previewMin, totalWidth * 0.4))
+        let persistedRatio = CGFloat(prefs.double(forKey: PreferenceKeys.splitRatio))
+        let ratio = max(0.2, min(0.8, persistedRatio > 0 ? persistedRatio : defaultSplitRatio))
+        let desiredLeft = max(outlineMin, min(totalWidth - previewMin, totalWidth * ratio))
         splitView.setPosition(desiredLeft, ofDividerAt: 0)
     }
     
@@ -530,8 +548,6 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         imageContainer.addSubview(webView)
         imageContainer.addSubview(previewSpinner)
         
-        let flexibleWidth = imageContainer.widthAnchor.constraint(equalToConstant: 0)
-        flexibleWidth.priority = .defaultLow
         NSLayoutConstraint.activate([
             previewImageView.leadingAnchor.constraint(equalTo: imageContainer.leadingAnchor),
             previewImageView.trailingAnchor.constraint(equalTo: imageContainer.trailingAnchor),
@@ -546,8 +562,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
             previewSpinner.centerXAnchor.constraint(equalTo: imageContainer.centerXAnchor),
             previewSpinner.centerYAnchor.constraint(equalTo: imageContainer.centerYAnchor),
             
-            imageContainer.heightAnchor.constraint(equalToConstant: 340),
-            flexibleWidth
+            imageContainer.heightAnchor.constraint(equalToConstant: 340)
         ])
         
         previewTitleLabel = NSTextField(labelWithString: "No Selection")
@@ -570,6 +585,13 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         stack.addArrangedSubview(previewInfoLabel)
         stack.addArrangedSubview(previewMessageLabel)
         stack.setCustomSpacing(4, after: previewTitleLabel)
+        
+        NSLayoutConstraint.activate([
+            imageContainer.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            previewTitleLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            previewInfoLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            previewMessageLabel.widthAnchor.constraint(equalTo: stack.widthAnchor)
+        ])
         
         pane.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -610,9 +632,35 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         return bar
     }
     
+    private func loadPreferredPreviewSize() -> CGSize {
+        let width = prefs.double(forKey: PreferenceKeys.previewWidth)
+        let height = prefs.double(forKey: PreferenceKeys.previewHeight)
+        let defaultSize = PreviewConstants.defaultPreviewSize
+        guard width >= 640, height >= 420 else {
+            return defaultSize
+        }
+        return CGSize(width: width, height: height)
+    }
+    
+    private func savePreferredPreviewSizeIfNeeded() {
+        guard view.bounds.width >= 640, view.bounds.height >= 420 else { return }
+        prefs.set(view.bounds.width, forKey: PreferenceKeys.previewWidth)
+        prefs.set(view.bounds.height, forKey: PreferenceKeys.previewHeight)
+        preferredContentSize = view.bounds.size
+    }
+    
     
     // MARK: - Preview Loading
     func preparePreviewOfFile(at url: URL, completionHandler handler: @escaping (Error?) -> Void) {
+        var hasCompleted = false
+        let completeOnce: (Error?) -> Void = { error in
+            guard !hasCompleted else { return }
+            hasCompleted = true
+            DispatchQueue.main.async {
+                handler(error)
+            }
+        }
+        
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 // Check if directory
@@ -646,13 +694,45 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
                                     :root { color-scheme: light dark; }
                                     body {
                                         margin: 0;
-                                        padding: 20px 60px 40px 60px;
                                         font-family: -apple-system, BlinkMacSystemFont, sans-serif;
                                         font-size: 15px;
                                         line-height: 1.6;
                                         color: #1d1d1f;
                                         background: #ffffff;
                                     }
+                                    .md-layout {
+                                        max-width: 1200px;
+                                        margin: 0 auto;
+                                        padding: 20px 24px 40px 24px;
+                                        display: grid;
+                                        grid-template-columns: minmax(0, 1fr) 230px;
+                                        gap: 24px;
+                                        align-items: start;
+                                    }
+                                    .md-content { min-width: 0; }
+                                    .md-toc {
+                                        position: sticky;
+                                        top: 16px;
+                                        border: 1px solid rgba(142,142,147,0.25);
+                                        border-radius: 10px;
+                                        padding: 10px 12px;
+                                        background: rgba(142,142,147,0.08);
+                                        max-height: calc(100vh - 40px);
+                                        overflow: auto;
+                                    }
+                                    .md-toc h4 {
+                                        margin: 0 0 8px 0;
+                                        font-size: 12px;
+                                        text-transform: uppercase;
+                                        letter-spacing: 0.04em;
+                                        color: #6a6a6a;
+                                    }
+                                    .md-toc ul { list-style: none; padding: 0; margin: 0; }
+                                    .md-toc li { margin: 4px 0; }
+                                    .md-toc li.level-2 { padding-left: 10px; }
+                                    .md-toc li.level-3 { padding-left: 20px; }
+                                    .md-toc a { text-decoration: none; color: inherit; font-size: 13px; }
+                                    .md-toc a:hover { text-decoration: underline; }
                                     @media (prefers-color-scheme: dark) {
                                         body { color: #e5e5e5; background: #1e1e1e; }
                                         a { color: #58a6ff; }
@@ -662,6 +742,11 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
                                         th { background: rgba(110,118,129,0.15); }
                                         td, th { border-color: rgba(110,118,129,0.3); }
                                         blockquote { border-left-color: rgba(110,118,129,0.4); color: #a0a0a0; }
+                                        .md-toc {
+                                            border-color: rgba(110,118,129,0.35);
+                                            background: rgba(110,118,129,0.16);
+                                        }
+                                        .md-toc h4 { color: rgba(235,235,245,0.6); }
                                     }
                                     h1, h2, h3, h4, h5, h6 { margin-top: 24px; margin-bottom: 16px; font-weight: 600; line-height: 1.25; }
                                     h1 { font-size: 2em; border-bottom: 1px solid #e1e4e8; padding-bottom: 8px; }
@@ -685,6 +770,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
                                         border: 1px solid #e1e4e8;
                                         margin: 16px 0;
                                     }
+                                    pre * { background: transparent !important; }
                                     pre code { background: none; padding: 0; }
                                     ul, ol { margin: 0 0 16px 0; padding-left: 32px; }
                                     li { margin: 4px 0; }
@@ -698,13 +784,50 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
                                     th, td { border: 1px solid #d0d7de; padding: 8px 12px; text-align: left; }
                                     th { background: #f6f8fa; font-weight: 600; }
                                     img { max-width: 100%; height: auto; border-radius: 8px; margin: 16px 0; }
+                                    @media (max-width: 900px) {
+                                        .md-layout { grid-template-columns: minmax(0, 1fr); padding: 20px 14px 24px 14px; }
+                                        .md-toc { position: static; max-height: none; }
+                                    }
                                 </style>
                             </head>
                             <body>
-                                <div id="content"></div>
+                                <div class="md-layout">
+                                    <div id="content" class="md-content"></div>
+                                    <nav id="toc" class="md-toc">
+                                        <h4>Contents</h4>
+                                        <ul id="toc-list"></ul>
+                                    </nav>
+                                </div>
                                 <script>
                                     const markdown = `\(escapedContent)`;
-                                    document.getElementById('content').innerHTML = marked.parse(markdown);
+                                    const content = document.getElementById('content');
+                                    const toc = document.getElementById('toc');
+                                    const tocList = document.getElementById('toc-list');
+                                    content.innerHTML = marked.parse(markdown);
+                                    
+                                    const headings = [...content.querySelectorAll('h1, h2, h3')];
+                                    const usedIds = {};
+                                    const slugify = (value) => {
+                                        const base = (value || 'section').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'section';
+                                        const count = (usedIds[base] || 0) + 1;
+                                        usedIds[base] = count;
+                                        return count === 1 ? base : `${base}-${count}`;
+                                    };
+                                    
+                                    if (!headings.length) {
+                                        toc.style.display = 'none';
+                                    } else {
+                                        headings.forEach((heading) => {
+                                            heading.id = slugify(heading.textContent);
+                                            const item = document.createElement('li');
+                                            item.className = `level-${heading.tagName.slice(1)}`;
+                                            const link = document.createElement('a');
+                                            link.href = `#${heading.id}`;
+                                            link.textContent = heading.textContent || heading.id;
+                                            item.appendChild(link);
+                                            tocList.appendChild(item);
+                                        });
+                                    }
                                 </script>
                             </body>
                             </html>
@@ -717,10 +840,24 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
                             }
                         }
                         
-                        handler(nil)
+                        completeOnce(nil)
                     }
                     return
                 }
+                
+                DispatchQueue.main.async {
+                    self.applySingleFileLayout(false)
+                    self.previewRootURL = url
+                    self.rootItems = []
+                    self.rebuildVisibleRootItems()
+                    self.outlineView.reloadData()
+                    self.previewTitleLabel.stringValue = "Loading…"
+                    self.previewInfoLabel.stringValue = "Gathering folder contents"
+                    self.previewMessageLabel.stringValue = ""
+                    self.previewMessageLabel.isHidden = true
+                    self.infoLabel.stringValue = "Loading…"
+                }
+                completeOnce(nil)
 
                 let start = CFAbsoluteTimeGetCurrent()
                 let contents = try FileManager.default.contentsOfDirectory(
@@ -733,24 +870,24 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
                 
                 let sortedContents = self.sortURLs(contents)
                 var rootItems: [FileItem] = []
-                var totalSize: Int64 = 0
-                var folderCount = 0
-                var fileCount = 0
+                var immediateTotalSize: Int64 = 0
+                var immediateFolderCount = 0
+                var immediateFileCount = 0
                 
                 for entry in sortedContents.prefix(500) {
                     let values = try entry.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .contentTypeKey, .contentModificationDateKey])
                     let item = FileItem(url: entry, resourceValues: values)
-                    if item.isFolder {
-                        folderCount += 1
-                    } else {
-                        fileCount += 1
-                        totalSize += item.size
-                    }
                     rootItems.append(item)
+                    if item.isFolder {
+                        immediateFolderCount += 1
+                    } else {
+                        immediateFileCount += 1
+                        immediateTotalSize += item.size
+                    }
                 }
                 self.sortFileItems(&rootItems)
                 
-                let infoText = "\(self.byteFormatter.string(fromByteCount: totalSize)) · \(folderCount) folders, \(fileCount) files"
+                let infoText = "\(self.byteFormatter.string(fromByteCount: immediateTotalSize)) · \(immediateFolderCount) folders, \(immediateFileCount) files"
                 
                 DispatchQueue.main.async {
                     self.applySingleFileLayout(false)
@@ -765,13 +902,28 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
                     self.infoLabel.stringValue = infoText
                     self.outlineView.reloadData()
                     self.syncPreviewWithSelection()
-                    handler(nil)
+                }
+                
+                DispatchQueue.global(qos: .utility).async {
+                    let recursive = self.recursiveStats(for: url, maxEntries: 50_000, timeBudget: 2.0)
+                    let recursiveInfoText = "\(self.byteFormatter.string(fromByteCount: recursive.totalSize)) · \(recursive.folderCount) folders, \(recursive.fileCount) files"
+                    DispatchQueue.main.async {
+                        guard self.previewRootURL == url else { return }
+                        self.infoLabel.stringValue = recursiveInfoText
+                    }
                 }
             } catch {
                 DebugLogger.shared.log("Failed to build preview for \(url.lastPathComponent): \(error.localizedDescription)")
                 DispatchQueue.main.async {
-                    handler(error)
+                    self.applySingleFileLayout(false)
+                    self.titleLabel.stringValue = url.lastPathComponent
+                    self.infoLabel.stringValue = "Could not load preview."
+                    self.rootItems = []
+                    self.rebuildVisibleRootItems()
+                    self.outlineView.reloadData()
+                    self.updatePreview(for: nil)
                 }
+                completeOnce(error)
             }
         }
     }
@@ -990,6 +1142,11 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
             webView.isHidden = true
             previewImageView.isHidden = false
             loadPreviewImage(for: item)
+        } else if item.isPDF {
+            previewImageView.isHidden = true
+            webView.isHidden = false
+            previewMessageLabel.isHidden = true
+            webView.loadFileURL(item.url, allowingReadAccessTo: item.url.deletingLastPathComponent())
         } else if item.isText {
             previewImageView.isHidden = true
             webView.isHidden = false
@@ -1002,7 +1159,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
                 guard let self, self.previewedItem === item else { return }
                 self.previewImageView.image = icon
             }
-            previewMessageLabel.stringValue = "Preview available for images and markdown only."
+            previewMessageLabel.stringValue = "Preview available for images, markdown, and PDF files."
             previewMessageLabel.isHidden = false
         }
     }
@@ -1017,56 +1174,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         DispatchQueue.global(qos: .userInitiated).async {
             let text = (try? String(contentsOf: item.url, encoding: .utf8)) ?? ""
             let htmlBody = self.makeHTML(fromMarkdown: text)
-            let template = """
-            <html>
-            <head>
-            <meta charset="utf-8">
-            <style>
-                :root { color-scheme: light dark; }
-                body {
-                    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-                    margin: 0;
-                    padding: 24px 28px;
-                    line-height: 1.5;
-                    background: transparent;
-                    color: #1f1f1f;
-                }
-                @media (prefers-color-scheme: dark) {
-                    body { color: #e5e5e5; }
-                }
-                h1, h2, h3, h4, h5, h6 { font-weight: 600; }
-                pre, code {
-                    font-family: Menlo, SFMono-Regular, Consolas, monospace;
-                }
-                pre {
-                    background-color: rgba(142,142,147,0.08);
-                    padding: 12px 16px;
-                    border-radius: 8px;
-                    overflow-x: auto;
-                }
-                table {
-                    border-collapse: collapse;
-                    width: 100%;
-                    margin: 16px 0;
-                }
-                th, td {
-                    border: 1px solid rgba(142,142,147,0.3);
-                    padding: 6px 8px;
-                    text-align: left;
-                }
-                blockquote {
-                    border-left: 3px solid rgba(142,142,147,0.4);
-                    margin: 0;
-                    padding-left: 12px;
-                    color: rgba(60,60,67,0.7);
-                }
-            </style>
-            </head>
-            <body>
-            \(htmlBody)
-            </body>
-            </html>
-            """
+            let template = self.makeMarkdownTemplate(htmlBody: htmlBody)
             DispatchQueue.main.async {
                 guard self.previewedItem === item else { return }
                 self.webView.loadHTMLString(template, baseURL: item.url.deletingLastPathComponent())
@@ -1094,6 +1202,209 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
             .replacingOccurrences(of: "<", with: "&lt;")
             .replacingOccurrences(of: ">", with: "&gt;")
         return "<pre>\(escaped)</pre>"
+    }
+    
+    private func makeMarkdownTemplate(htmlBody: String) -> String {
+        let result = addAnchorsAndBuildTOC(from: htmlBody)
+        let tocSection = result.tocHTML.isEmpty ? "" : """
+        <nav class="md-toc">
+            <h4>Contents</h4>
+            <ul>\(result.tocHTML)</ul>
+        </nav>
+        """
+        
+        return """
+        <html>
+        <head>
+        <meta charset="utf-8">
+        <style>
+            :root { color-scheme: light dark; }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+                margin: 0;
+                line-height: 1.5;
+                background: transparent;
+                color: #1f1f1f;
+            }
+            .md-layout {
+                display: grid;
+                grid-template-columns: minmax(0, 1fr) 220px;
+                gap: 20px;
+                align-items: start;
+                padding: 18px 20px 20px 20px;
+            }
+            .md-content { min-width: 0; }
+            .md-toc {
+                position: sticky;
+                top: 14px;
+                border: 1px solid rgba(142,142,147,0.25);
+                border-radius: 10px;
+                padding: 10px 12px;
+                background: rgba(142,142,147,0.08);
+                max-height: calc(100vh - 30px);
+                overflow: auto;
+            }
+            .md-toc h4 {
+                margin: 0 0 8px 0;
+                font-size: 12px;
+                text-transform: uppercase;
+                letter-spacing: 0.04em;
+                color: #6a6a6a;
+            }
+            .md-toc ul { list-style: none; padding: 0; margin: 0; }
+            .md-toc li { margin: 4px 0; }
+            .md-toc li.level-2 { padding-left: 10px; }
+            .md-toc li.level-3 { padding-left: 20px; }
+            .md-toc a { text-decoration: none; color: inherit; font-size: 13px; }
+            .md-toc a:hover { text-decoration: underline; }
+            @media (prefers-color-scheme: dark) {
+                body { color: #e5e5e5; }
+                pre {
+                    background-color: rgba(110,118,129,0.18);
+                    border: 1px solid rgba(110,118,129,0.35);
+                }
+                code {
+                    background-color: rgba(110,118,129,0.22);
+                    color: #f2f4f7;
+                }
+                th, td { border-color: rgba(110,118,129,0.35); }
+                th { background-color: rgba(110,118,129,0.15); }
+                blockquote {
+                    border-left-color: rgba(110,118,129,0.45);
+                    color: rgba(235,235,245,0.65);
+                }
+                .md-toc {
+                    border-color: rgba(110,118,129,0.35);
+                    background: rgba(110,118,129,0.16);
+                }
+                .md-toc h4 { color: rgba(235,235,245,0.6); }
+            }
+            h1, h2, h3, h4, h5, h6 { font-weight: 600; }
+            pre, code {
+                font-family: Menlo, SFMono-Regular, Consolas, monospace;
+            }
+                pre {
+                    background-color: rgba(142,142,147,0.08);
+                    border: 1px solid rgba(142,142,147,0.22);
+                    padding: 12px 16px;
+                    border-radius: 8px;
+                    overflow-x: auto;
+                }
+                pre * { background: transparent !important; }
+                code {
+                    background-color: rgba(142,142,147,0.2);
+                    border-radius: 4px;
+                    padding: 1px 4px;
+                }
+                pre code {
+                    background: transparent !important;
+                    padding: 0 !important;
+                    color: inherit !important;
+                }
+            table {
+                border-collapse: collapse;
+                width: 100%;
+                margin: 16px 0;
+            }
+            th, td {
+                border: 1px solid rgba(142,142,147,0.3);
+                padding: 6px 8px;
+                text-align: left;
+            }
+            blockquote {
+                border-left: 3px solid rgba(142,142,147,0.4);
+                margin: 0;
+                padding-left: 12px;
+                color: rgba(60,60,67,0.7);
+            }
+            @media (max-width: 920px) {
+                .md-layout { grid-template-columns: minmax(0, 1fr); padding: 16px 12px 16px 12px; }
+                .md-toc { position: static; max-height: none; }
+            }
+        </style>
+        </head>
+        <body>
+        <div class="md-layout">
+            <article class="md-content">\(result.bodyWithAnchors)</article>
+            \(tocSection)
+        </div>
+        </body>
+        </html>
+        """
+    }
+    
+    private func addAnchorsAndBuildTOC(from html: String) -> (bodyWithAnchors: String, tocHTML: String) {
+        guard let regex = try? NSRegularExpression(pattern: "<h([1-6])([^>]*)>(.*?)</h\\1>", options: [.caseInsensitive, .dotMatchesLineSeparators]) else {
+            return (html, "")
+        }
+        
+        let fullRange = NSRange(location: 0, length: html.utf16.count)
+        let matches = regex.matches(in: html, options: [], range: fullRange)
+        guard !matches.isEmpty else {
+            return (html, "")
+        }
+        
+        let mutableBody = NSMutableString(string: html)
+        var tocItems: [String] = []
+        var usedIDs: [String: Int] = [:]
+        
+        for match in matches.reversed() {
+            guard
+                let levelRange = Range(match.range(at: 1), in: html),
+                let attrsRange = Range(match.range(at: 2), in: html),
+                let contentRange = Range(match.range(at: 3), in: html)
+            else { continue }
+            
+            let level = Int(html[levelRange]) ?? 1
+            let attributes = String(html[attrsRange])
+            let content = String(html[contentRange])
+            let text = stripHTML(content).trimmingCharacters(in: .whitespacesAndNewlines)
+            let baseID = slugifyHeadingID(text)
+            let usage = (usedIDs[baseID] ?? 0) + 1
+            usedIDs[baseID] = usage
+            let finalID = usage == 1 ? baseID : "\(baseID)-\(usage)"
+            let heading = "<h\(level)\(attributes) id=\"\(finalID)\">\(content)</h\(level)>"
+            
+            mutableBody.replaceCharacters(in: match.range(at: 0), with: heading)
+            
+            if level <= 3 && !text.isEmpty {
+                tocItems.append("<li class=\"level-\(level)\"><a href=\"#\(finalID)\">\(escapeHTML(text))</a></li>")
+            }
+        }
+        
+        return (mutableBody as String, tocItems.reversed().joined())
+    }
+    
+    private func stripHTML(_ value: String) -> String {
+        guard let regex = try? NSRegularExpression(pattern: "<[^>]+>", options: []) else {
+            return value
+        }
+        let range = NSRange(location: 0, length: value.utf16.count)
+        let noTags = regex.stringByReplacingMatches(in: value, options: [], range: range, withTemplate: "")
+        return noTags.replacingOccurrences(of: "&nbsp;", with: " ")
+    }
+    
+    private func slugifyHeadingID(_ text: String) -> String {
+        let lowered = text.lowercased()
+        let pieces = lowered.unicodeScalars.map { scalar -> String in
+            if CharacterSet.alphanumerics.contains(scalar) {
+                return String(scalar)
+            }
+            return "-"
+        }
+        let joined = pieces.joined()
+        let collapsed = joined.replacingOccurrences(of: "-{2,}", with: "-", options: .regularExpression)
+        let trimmed = collapsed.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        return trimmed.isEmpty ? "section" : trimmed
+    }
+    
+    private func escapeHTML(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "'", with: "&#39;")
     }
     
     private func extractBody(from html: String) -> String {
@@ -1171,8 +1482,53 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
     private lazy var contextMenu: NSMenu = {
         let menu = NSMenu(title: "Actions")
         menu.addItem(withTitle: "Copy Path", action: #selector(copyPathAction), keyEquivalent: "")
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(withTitle: "Expand All", action: #selector(expandAllAction), keyEquivalent: "")
+        menu.addItem(withTitle: "Collapse All", action: #selector(collapseAllAction), keyEquivalent: "")
         return menu
     }()
+    
+    @objc private func expandAllAction() {
+        outlineView.expandItem(nil, expandChildren: true)
+    }
+    
+    @objc private func collapseAllAction() {
+        outlineView.collapseItem(nil, collapseChildren: true)
+    }
+    
+    private func recursiveStats(for rootURL: URL, maxEntries: Int = 50_000, timeBudget: TimeInterval = 2.0) -> (totalSize: Int64, folderCount: Int, fileCount: Int) {
+        guard let enumerator = FileManager.default.enumerator(
+            at: rootURL,
+            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return (0, 0, 0)
+        }
+        
+        var totalSize: Int64 = 0
+        var folderCount = 0
+        var fileCount = 0
+        var visited = 0
+        let deadline = Date().addingTimeInterval(max(0.2, timeBudget))
+        
+        for case let entryURL as URL in enumerator {
+            visited += 1
+            if visited > maxEntries || Date() >= deadline {
+                break
+            }
+            guard let values = try? entryURL.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .isRegularFileKey]) else { continue }
+            if values.isDirectory == true {
+                folderCount += 1
+                continue
+            }
+            if values.isRegularFile == true {
+                fileCount += 1
+                totalSize += Int64(values.fileSize ?? 0)
+            }
+        }
+        
+        return (totalSize, folderCount, fileCount)
+    }
     
     
     private func loadChildren(for item: FileItem, completion: @escaping () -> Void) {
@@ -1406,7 +1762,18 @@ extension PreviewViewController: NSMenuDelegate {
             outlineView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
         }
         let hasSelection = !selectedItems.isEmpty
-        menu.items.forEach { $0.isEnabled = hasSelection }
+        for item in menu.items where item.action == #selector(copyPathAction) {
+            item.isEnabled = hasSelection
+        }
+    }
+}
+
+extension PreviewViewController: NSSplitViewDelegate {
+    func splitViewDidResizeSubviews(_ notification: Notification) {
+        guard splitView.bounds.width > 0, splitView.subviews.count >= 2 else { return }
+        let leftWidth = splitView.subviews[0].frame.width
+        let ratio = max(0.2, min(0.8, leftWidth / splitView.bounds.width))
+        prefs.set(ratio, forKey: PreferenceKeys.splitRatio)
     }
 }
 
