@@ -78,6 +78,10 @@ protocol FinderOutlineViewKeyboardDelegate: AnyObject {
     func outlineView(_ outlineView: FinderOutlineView, handle event: NSEvent) -> Bool
 }
 
+protocol FinderCollectionViewKeyboardDelegate: AnyObject {
+    func collectionView(_ collectionView: FinderCollectionView, handle event: NSEvent) -> Bool
+}
+
 /// Custom outline view that intercepts keyboard events for QuickLook-specific shortcuts
 final class FinderOutlineView: NSOutlineView {
     weak var keyboardDelegate: FinderOutlineViewKeyboardDelegate?
@@ -90,6 +94,84 @@ final class FinderOutlineView: NSOutlineView {
             return
         }
         super.keyDown(with: event)
+    }
+}
+
+final class FinderCollectionView: NSCollectionView {
+    weak var keyboardDelegate: FinderCollectionViewKeyboardDelegate?
+
+    override var acceptsFirstResponder: Bool { true }
+    override var needsPanelToBecomeKey: Bool { false }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        super.mouseDown(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if keyboardDelegate?.collectionView(self, handle: event) == true {
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.modifierFlags.contains(.command) {
+            if keyboardDelegate?.collectionView(self, handle: event) == true {
+                return true
+            }
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
+final class FinderGridItem: NSCollectionViewItem {
+    static let identifier = NSUserInterfaceItemIdentifier("FinderGridItem")
+
+    override func loadView() {
+        let root = NSView()
+        root.translatesAutoresizingMaskIntoConstraints = false
+        root.wantsLayer = true
+        root.layer?.cornerRadius = 8
+        root.layer?.masksToBounds = true
+
+        let image = NSImageView()
+        image.translatesAutoresizingMaskIntoConstraints = false
+        image.imageScaling = .scaleProportionallyUpOrDown
+        image.imageAlignment = .alignCenter
+
+        let label = NSTextField(labelWithString: "")
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.alignment = .center
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 2
+        label.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        label.textColor = .labelColor
+
+        root.addSubview(image)
+        root.addSubview(label)
+
+        NSLayoutConstraint.activate([
+            image.topAnchor.constraint(equalTo: root.topAnchor, constant: 8),
+            image.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 8),
+            image.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -8),
+            image.heightAnchor.constraint(equalToConstant: 72),
+
+            label.topAnchor.constraint(equalTo: image.bottomAnchor, constant: 6),
+            label.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 6),
+            label.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -6),
+            label.bottomAnchor.constraint(lessThanOrEqualTo: root.bottomAnchor, constant: -6)
+        ])
+
+        self.view = root
+        self.imageView = image
+        self.textField = label
+    }
+
+    override var isSelected: Bool {
+        didSet {
+            view.layer?.backgroundColor = isSelected ? NSColor.selectedContentBackgroundColor.withAlphaComponent(0.25).cgColor : NSColor.clear.cgColor
+        }
     }
 }
 
@@ -226,11 +308,19 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
             }
         }
     }
+
+    private enum ViewMode: Int {
+        case list = 0
+        case grid = 1
+        case fullList = 2
+    }
     
     // MARK: - UI Components
     
     private var mainStack: NSStackView!
     private var scrollView: NSScrollView!
+    private var gridScrollView: NSScrollView!
+    private var collectionView: FinderCollectionView!
     private var splitView: NSSplitView!
     private var outlineView: FinderOutlineView!
     private var headerView: NSView!
@@ -239,6 +329,9 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
     private var infoLabel: NSTextField!
     private var controlsStack: NSStackView!
     private var filterControl: NSSegmentedControl!
+    private var sortKeyControl: NSSegmentedControl!
+    private var sortOrderControl: NSSegmentedControl!
+    private var viewModeControl: NSSegmentedControl!
     private var previewPane: NSView!
     private var pathBarView: NSView!
     private var pathControl: NSPathControl!
@@ -249,11 +342,14 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
     private var previewTitleLabel: NSTextField!
     private var previewInfoLabel: NSTextField!
     private var previewMessageLabel: NSTextField!
+    private var previewPaneMinWidthConstraint: NSLayoutConstraint?
+    private var outlinePaneMinWidthConstraint: NSLayoutConstraint?
     
     // MARK: - Performance Caches
     
     private let iconCache = NSCache<NSString, NSImage>()
     private let iconLoadQueue = DispatchQueue(label: "com.peekx.iconloader", qos: .userInitiated, attributes: .concurrent)
+    private let thumbnailCache = NSCache<NSString, NSImage>()
     
     // MARK: - Data State
     
@@ -265,9 +361,13 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
     private var previewImageLoadTask: DispatchWorkItem?
     private var previewFallbackTask: DispatchWorkItem?
     private var previewRootURL: URL?
+    private var activeArchiveExtractionURL: URL?
     private var didSetInitialSplitPosition = false
     private var singleFileMode = false
     private var previewUpdateWorkItem: DispatchWorkItem?
+    private var currentViewMode: ViewMode = .list
+    private var gridContextItem: FileItem?
+    private var isApplyingSplitRatio = false
     
     private let prefs = UserDefaults.standard
     private let defaultSplitRatio: CGFloat = 0.4
@@ -276,6 +376,11 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         static let previewWidth = "peekx.previewWidth"
         static let previewHeight = "peekx.previewHeight"
         static let splitRatio = "peekx.splitRatio"
+        static let viewMode = "peekx.viewMode"
+    }
+
+    deinit {
+        cleanupActiveArchiveExtraction()
     }
     
     // MARK: - Formatters
@@ -314,6 +419,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         
         headerView = createHeaderView()
         controlsStack = createControlsStack()
+        pathBarView = createPathBar()
         
         scrollView = NSScrollView()
         scrollView.translatesAutoresizingMaskIntoConstraints = false
@@ -338,23 +444,58 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         outlineView.menu?.delegate = self
         
         scrollView.documentView = outlineView
+
+        let layout = NSCollectionViewFlowLayout()
+        layout.sectionInset = NSEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
+        layout.minimumInteritemSpacing = 10
+        layout.minimumLineSpacing = 12
+        layout.itemSize = NSSize(width: 110, height: 112)
+
+        collectionView = FinderCollectionView()
+        collectionView.translatesAutoresizingMaskIntoConstraints = false
+        collectionView.collectionViewLayout = layout
+        collectionView.delegate = self
+        collectionView.dataSource = self
+        collectionView.keyboardDelegate = self
+        collectionView.isSelectable = true
+        collectionView.register(FinderGridItem.self, forItemWithIdentifier: FinderGridItem.identifier)
+        collectionView.backgroundColors = [.clear]
+        let doubleClick = NSClickGestureRecognizer(target: self, action: #selector(handleGridDoubleClick(_:)))
+        doubleClick.numberOfClicksRequired = 2
+        collectionView.addGestureRecognizer(doubleClick)
+
+        gridScrollView = NSScrollView()
+        gridScrollView.translatesAutoresizingMaskIntoConstraints = false
+        gridScrollView.hasVerticalScroller = true
+        gridScrollView.autohidesScrollers = true
+        gridScrollView.borderType = .noBorder
+        gridScrollView.documentView = collectionView
+        gridScrollView.isHidden = true
         
         splitView = NSSplitView()
         splitView.translatesAutoresizingMaskIntoConstraints = false
         splitView.isVertical = true
-        splitView.dividerStyle = .thin
+        splitView.dividerStyle = .paneSplitter
         splitView.delegate = self
         splitView.addArrangedSubview(scrollView)
         previewPane = createPreviewPane()
         splitView.addArrangedSubview(previewPane)
         splitView.setHoldingPriority(.defaultLow, forSubviewAt: 0)
-        splitView.setHoldingPriority(.defaultHigh, forSubviewAt: 1)
-        splitView.arrangedSubviews[0].widthAnchor.constraint(greaterThanOrEqualToConstant: 280).isActive = true
-        splitView.arrangedSubviews[1].widthAnchor.constraint(greaterThanOrEqualToConstant: 340).isActive = true
+        splitView.setHoldingPriority(.defaultLow, forSubviewAt: 1)
+        outlinePaneMinWidthConstraint = splitView.arrangedSubviews[0].widthAnchor.constraint(greaterThanOrEqualToConstant: 280)
+        previewPaneMinWidthConstraint = splitView.arrangedSubviews[1].widthAnchor.constraint(greaterThanOrEqualToConstant: 340)
+        outlinePaneMinWidthConstraint?.isActive = true
+        previewPaneMinWidthConstraint?.isActive = true
+        splitView.arrangedSubviews[0].setContentHuggingPriority(.defaultLow, for: .horizontal)
+        splitView.arrangedSubviews[0].setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        splitView.arrangedSubviews[1].setContentHuggingPriority(.defaultLow, for: .horizontal)
+        splitView.arrangedSubviews[1].setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         
         mainStack.addArrangedSubview(headerView)
         mainStack.addArrangedSubview(controlsStack)
         mainStack.addArrangedSubview(splitView)
+        mainStack.addArrangedSubview(gridScrollView)
+        mainStack.addArrangedSubview(pathBarView)
 
         container.addSubview(mainStack)
         
@@ -366,13 +507,18 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
             
             headerView.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
             controlsStack.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
-            splitView.widthAnchor.constraint(equalTo: mainStack.widthAnchor)
+            splitView.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
+            gridScrollView.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
+            pathBarView.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
+            pathBarView.heightAnchor.constraint(equalToConstant: 30)
         ])
         
         // Content priorities to ensure SplitView fills space
         headerView.setContentHuggingPriority(.required, for: .vertical)
         controlsStack.setContentHuggingPriority(.required, for: .vertical)
+        pathBarView.setContentHuggingPriority(.required, for: .vertical)
         splitView.setContentHuggingPriority(.defaultLow, for: .vertical)
+        gridScrollView.setContentHuggingPriority(.defaultLow, for: .vertical)
         
         // Create standalone WebView for single-file mode
         let singleFileConfig = WKWebViewConfiguration()
@@ -391,12 +537,24 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         
         createColumns()
         updatePreview(for: nil)
+        let storedMode = prefs.integer(forKey: PreferenceKeys.viewMode)
+        // Preserve previous values and add full-list mode.
+        switch storedMode {
+        case 1:
+            currentViewMode = .grid
+        case 2:
+            currentViewMode = .fullList
+        default:
+            currentViewMode = .list
+        }
+        viewModeControl.selectedSegment = currentViewMode.rawValue
+        updatePathBar()
         self.view = container
     }
     
     override func viewDidAppear() {
         super.viewDidAppear()
-        outlineView.window?.makeFirstResponder(outlineView)
+        focusPrimaryBrowser()
     }
     
     override func viewDidLayout() {
@@ -405,6 +563,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         if !didSetInitialSplitPosition {
             didSetInitialSplitPosition = true
             setDefaultSplitPosition()
+            applyViewMode(currentViewMode)
         }
     }
     
@@ -455,8 +614,23 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         filterControl = NSSegmentedControl(labels: ["All", "Folders", "Images", "Docs", "Media"], trackingMode: .selectOne, target: self, action: #selector(filterChanged(_:)))
         filterControl.selectedSegment = FilterType.all.rawValue
         filterControl.translatesAutoresizingMaskIntoConstraints = false
+
+        sortKeyControl = NSSegmentedControl(labels: ["Name", "Date", "Size", "Kind"], trackingMode: .selectOne, target: self, action: #selector(sortKeyChanged(_:)))
+        sortKeyControl.selectedSegment = 0
+        sortKeyControl.translatesAutoresizingMaskIntoConstraints = false
+
+        sortOrderControl = NSSegmentedControl(labels: ["Asc", "Desc"], trackingMode: .selectOne, target: self, action: #selector(sortOrderChanged(_:)))
+        sortOrderControl.selectedSegment = 0
+        sortOrderControl.translatesAutoresizingMaskIntoConstraints = false
+
+        viewModeControl = NSSegmentedControl(labels: ["List", "Grid", "Full List"], trackingMode: .selectOne, target: self, action: #selector(viewModeChanged(_:)))
+        viewModeControl.selectedSegment = ViewMode.list.rawValue
+        viewModeControl.translatesAutoresizingMaskIntoConstraints = false
         
-        let stack = NSStackView(views: [filterControl])
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+
+        let stack = NSStackView(views: [filterControl, sortKeyControl, sortOrderControl, spacer, viewModeControl])
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.orientation = .horizontal
         stack.alignment = .centerY
@@ -465,23 +639,83 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         // Ensure the stack itself doesn't force a specific width if not needed, 
         // but we can center the filter control inside it.
         
-        NSLayoutConstraint.activate([
-            filterControl.widthAnchor.constraint(equalToConstant: 320)
-        ])
+        let filterWidth = filterControl.widthAnchor.constraint(equalToConstant: 300)
+        let sortKeyWidth = sortKeyControl.widthAnchor.constraint(equalToConstant: 240)
+        let sortOrderWidth = sortOrderControl.widthAnchor.constraint(equalToConstant: 110)
+        let viewModeWidth = viewModeControl.widthAnchor.constraint(equalToConstant: 210)
+
+        for constraint in [filterWidth, sortKeyWidth, sortOrderWidth, viewModeWidth] {
+            constraint.priority = .defaultHigh
+            constraint.isActive = true
+        }
         
         return stack
     }
     
     private func setDefaultSplitPosition() {
-        view.layoutSubtreeIfNeeded()
-        let totalWidth = splitView.bounds.width
-        guard totalWidth > 0 else { return }
-        let previewMin: CGFloat = 360
-        let outlineMin: CGFloat = 320
         let persistedRatio = CGFloat(prefs.double(forKey: PreferenceKeys.splitRatio))
         let ratio = max(0.2, min(0.8, persistedRatio > 0 ? persistedRatio : defaultSplitRatio))
-        let desiredLeft = max(outlineMin, min(totalWidth - previewMin, totalWidth * ratio))
+        applySplitRatio(ratio)
+    }
+
+    private func applySplitRatio(_ ratio: CGFloat) {
+        guard splitView.subviews.count >= 2 else { return }
+        let clampedRatio = max(0.2, min(0.8, ratio))
+        view.layoutSubtreeIfNeeded()
+
+        let totalWidth = splitView.bounds.width
+        guard totalWidth > 0 else { return }
+
+        let minLeft: CGFloat = 280
+        let minRight: CGFloat = currentViewMode == .fullList ? 0 : 340
+        let maxLeft = max(minLeft, totalWidth - minRight)
+        let desiredLeft = min(max(totalWidth * clampedRatio, minLeft), maxLeft)
+        isApplyingSplitRatio = true
         splitView.setPosition(desiredLeft, ofDividerAt: 0)
+        splitView.adjustSubviews()
+        isApplyingSplitRatio = false
+    }
+
+    private func applyViewMode(_ mode: ViewMode) {
+        let previousMode = currentViewMode
+        currentViewMode = mode
+        prefs.set(mode.rawValue, forKey: PreferenceKeys.viewMode)
+
+        guard !singleFileMode else { return }
+
+        switch mode {
+        case .list:
+            splitView.isHidden = false
+            gridScrollView.isHidden = true
+            previewPane.isHidden = false
+            previewPaneMinWidthConstraint?.isActive = true
+            // Keep user-resized split position while staying in list mode.
+            // Only restore persisted/default split when returning from another mode.
+            if previousMode != .list {
+                setDefaultSplitPosition()
+            }
+        case .grid:
+            splitView.isHidden = true
+            gridScrollView.isHidden = false
+            collectionView.reloadData()
+        case .fullList:
+            splitView.isHidden = false
+            gridScrollView.isHidden = true
+            previewPane.isHidden = true
+            previewPaneMinWidthConstraint?.isActive = false
+            view.layoutSubtreeIfNeeded()
+            let totalWidth = splitView.bounds.width
+            if totalWidth > 0 {
+                splitView.setPosition(totalWidth - 1, ofDividerAt: 0)
+            }
+        }
+        updatePathBar()
+        focusPrimaryBrowser()
+    }
+
+    private func focusPrimaryBrowser() {
+        let responder: NSResponder = currentViewMode == .grid ? collectionView : outlineView
+        (responder as? NSView)?.window?.makeFirstResponder(responder)
     }
     
     private func createColumns() {
@@ -659,6 +893,8 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
     
     // MARK: - Preview Loading
     func preparePreviewOfFile(at url: URL, completionHandler handler: @escaping (Error?) -> Void) {
+        cleanupActiveArchiveExtraction()
+
         var hasCompleted = false
         let completeOnce: (Error?) -> Void = { error in
             guard !hasCompleted else { return }
@@ -673,6 +909,28 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
                 // Check if directory
                 let values = try url.resourceValues(forKeys: [.isDirectoryKey])
                 if values.isDirectory == false {
+                    if self.isArchiveURL(url) {
+                        DispatchQueue.main.async {
+                            self.applySingleFileLayout(false)
+                            self.filterType = .all
+                            self.filterControl.selectedSegment = FilterType.all.rawValue
+                            self.previewRootURL = url
+                            self.rootItems = []
+                            self.rebuildVisibleRootItems()
+                            self.outlineView.reloadData()
+                            self.collectionView.reloadData()
+                            let icon = NSWorkspace.shared.icon(forFile: url.path)
+                            icon.size = NSSize(width: 48, height: 48)
+                            self.iconImageView.image = icon
+                            self.titleLabel.stringValue = url.lastPathComponent
+                            self.infoLabel.stringValue = "Loading archive contents…"
+                            self.updatePreview(for: nil)
+                        }
+                        completeOnce(nil)
+                        self.loadArchivePreview(from: url)
+                        return
+                    }
+
                     DebugLogger.shared.log("Detected single file preview: \(url.lastPathComponent)")
                     
                     DispatchQueue.main.async {
@@ -867,9 +1125,11 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
                 DispatchQueue.main.async {
                     self.applySingleFileLayout(false)
                     self.previewRootURL = url
+                    self.gridContextItem = nil
                     self.rootItems = []
                     self.rebuildVisibleRootItems()
                     self.outlineView.reloadData()
+                    self.collectionView.reloadData()
                     self.previewTitleLabel.stringValue = "Loading…"
                     self.previewInfoLabel.stringValue = "Gathering folder contents"
                     self.previewMessageLabel.stringValue = ""
@@ -915,6 +1175,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
                     let icon = NSWorkspace.shared.icon(forFile: url.path)
                     icon.size = NSSize(width: 48, height: 48)
                     DebugLogger.shared.log("Applying preview data for \(url.lastPathComponent). Diagnostics log: \(DebugLogger.shared.locationDescription())")
+                    self.gridContextItem = nil
                     self.rootItems = rootItems
                     self.previewRootURL = url
                     self.rebuildVisibleRootItems()
@@ -922,6 +1183,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
                     self.titleLabel.stringValue = url.lastPathComponent
                     self.infoLabel.stringValue = infoText
                     self.outlineView.reloadData()
+                    self.collectionView.reloadData()
                     self.syncPreviewWithSelection()
                 }
                 
@@ -939,9 +1201,11 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
                     self.applySingleFileLayout(false)
                     self.titleLabel.stringValue = url.lastPathComponent
                     self.infoLabel.stringValue = "Could not load preview."
+                    self.gridContextItem = nil
                     self.rootItems = []
                     self.rebuildVisibleRootItems()
                     self.outlineView.reloadData()
+                    self.collectionView.reloadData()
                     self.updatePreview(for: nil)
                 }
                 completeOnce(error)
@@ -963,8 +1227,82 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         // Use targeted reload instead of full reloadData() - significantly faster
         // This reloads only the root level items rather than the entire table structure
         outlineView.reloadItem(nil, reloadChildren: true)
+        collectionView.reloadData()
         
         syncPreviewWithSelection()
+        focusPrimaryBrowser()
+    }
+
+    @objc private func viewModeChanged(_ sender: NSSegmentedControl) {
+        guard let mode = ViewMode(rawValue: sender.selectedSegment) else { return }
+        applyViewMode(mode)
+    }
+
+    @objc private func sortKeyChanged(_ sender: NSSegmentedControl) {
+        guard let key = sortKey(for: sender.selectedSegment) else { return }
+        setSortDescriptor(key: key, ascending: sortOrderControl.selectedSegment == 0)
+        focusPrimaryBrowser()
+    }
+
+    @objc private func sortOrderChanged(_ sender: NSSegmentedControl) {
+        let key = currentSortDescriptor?.key ?? "name"
+        setSortDescriptor(key: key, ascending: sender.selectedSegment == 0)
+        focusPrimaryBrowser()
+    }
+
+    private func sortKey(for segment: Int) -> String? {
+        switch segment {
+        case 0: return "name"
+        case 1: return "date"
+        case 2: return "size"
+        case 3: return "kind"
+        default: return nil
+        }
+    }
+
+    private func segment(forSortKey key: String?) -> Int {
+        switch key ?? "name" {
+        case "date": return 1
+        case "size": return 2
+        case "kind": return 3
+        default: return 0
+        }
+    }
+
+    private func setSortDescriptor(key: String, ascending: Bool) {
+        let descriptor: NSSortDescriptor
+        if key == "name" {
+            descriptor = NSSortDescriptor(key: key, ascending: ascending, selector: #selector(NSString.localizedStandardCompare(_:)))
+        } else {
+            descriptor = NSSortDescriptor(key: key, ascending: ascending)
+        }
+        currentSortDescriptor = descriptor
+        sortKeyControl.selectedSegment = segment(forSortKey: key)
+        sortOrderControl.selectedSegment = ascending ? 0 : 1
+        outlineView.sortDescriptors = [descriptor]
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            self.sortFileItems(&self.rootItems)
+            self.resortDescendants(from: self.rootItems)
+            DispatchQueue.main.async {
+                self.rebuildVisibleRootItems()
+                self.outlineView.reloadItem(nil, reloadChildren: true)
+                self.collectionView.reloadData()
+                self.syncPreviewWithSelection()
+            }
+        }
+    }
+
+    @objc private func handleGridDoubleClick(_ recognizer: NSClickGestureRecognizer) {
+        guard recognizer.state == .ended else { return }
+        let point = recognizer.location(in: collectionView)
+        guard let indexPath = collectionView.indexPathForItem(at: point) else { return }
+        let items = currentGridItems
+        guard indexPath.item < items.count else { return }
+        let item = items[indexPath.item]
+        guard item.isFolder else { return }
+        enterGridFolder(item)
     }
     
     // MARK: - Helpers
@@ -1097,24 +1435,65 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         }
         return visibleRootItems
     }
+
+    private var currentGridItems: [FileItem] {
+        if let context = gridContextItem {
+            return children(of: context)
+        }
+        return visibleRootItems
+    }
     
     private func filterItems(_ items: [FileItem]) -> [FileItem] {
         items.filter { item in
             filterType.matches(item)
         }
     }
+
+    private func enterGridFolder(_ folder: FileItem) {
+        loadChildren(for: folder) { [weak self] in
+            guard let self else { return }
+            self.gridContextItem = folder
+            self.collectionView.reloadData()
+            self.collectionView.deselectAll(nil)
+            self.previewedItem = nil
+            self.updatePathBar()
+        }
+    }
+
+    private func exitGridFolder() {
+        guard let current = gridContextItem else { return }
+        gridContextItem = current.parent
+        collectionView.reloadData()
+        collectionView.deselectAll(nil)
+        previewedItem = nil
+        updatePathBar()
+    }
     
-    // Path bar update (commented out - path bar not displayed)
-    // private func updatePreviewPath(for item: FileItem?) {
-    //     guard let referenceRoot = previewRootURL ?? item?.url else {
-    //         pathControl.url = nil
-    //         return
-    //     }
-    //     let target = item?.url ?? referenceRoot
-    //     pathControl.url = target
-    // }
+    private func updatePathBar() {
+        guard !singleFileMode else {
+            pathBarView.isHidden = true
+            return
+        }
+        let selected = selectedItems.last?.url
+        let target: URL?
+        if let selected {
+            target = selected
+        } else if currentViewMode == .grid, let context = gridContextItem?.url {
+            target = context
+        } else {
+            target = previewRootURL
+        }
+        pathControl.url = target
+        pathBarView.isHidden = (target == nil)
+    }
     
     private func syncPreviewWithSelection() {
+        if currentViewMode == .grid {
+            previewedItem = selectedItems.last
+            updatePathBar()
+            return
+        }
+
         // Cancel any pending preview update
         previewUpdateWorkItem?.cancel()
         
@@ -1148,7 +1527,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
             previewMessageLabel.stringValue = ""
             previewMessageLabel.isHidden = true
             CATransaction.commit()
-            // updatePreviewPath(for: nil)
+            updatePathBar()
             return
         }
         
@@ -1158,7 +1537,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         previewMessageLabel.isHidden = true
         
         CATransaction.commit()
-        // updatePreviewPath(for: item)
+        updatePathBar()
         
         // Use cached type checks instead of repeated UTType conformance checks
         webView.isHidden = true
@@ -1190,6 +1569,10 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         singleFileMode = enabled
         mainStack.isHidden = enabled
         singleFileWebView.isHidden = !enabled
+        pathBarView.isHidden = enabled
+        if !enabled {
+            applyViewMode(currentViewMode)
+        }
     }
     
     private func loadMarkdownPreview(for item: FileItem) {
@@ -1551,7 +1934,16 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
     }
     
     private var selectedItems: [FileItem] {
-        outlineView.selectedRowIndexes.compactMap { outlineView.item(atRow: $0) as? FileItem }
+        if currentViewMode == .grid {
+            return collectionView.selectionIndexPaths
+                .sorted { $0.item < $1.item }
+                .compactMap { indexPath in
+                    let items = currentGridItems
+                    guard indexPath.item < items.count else { return nil }
+                    return items[indexPath.item]
+                }
+        }
+        return outlineView.selectedRowIndexes.compactMap { outlineView.item(atRow: $0) as? FileItem }
     }
     
     private func actionURLs() -> [URL] {
@@ -1733,6 +2125,313 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
             }
         }
     }
+
+    private func loadGridThumbnail(for item: FileItem, completion: @escaping (NSImage) -> Void) {
+        let key = "grid-\(item.url.path)" as NSString
+        if let cached = thumbnailCache.object(forKey: key) {
+            completion(cached)
+            return
+        }
+
+        if item.isFolder {
+            loadLargeIcon(for: item) { [weak self] icon in
+                self?.thumbnailCache.setObject(icon, forKey: key)
+                completion(icon)
+            }
+            return
+        }
+
+        let request = QLThumbnailGenerator.Request(
+            fileAt: item.url,
+            size: CGSize(width: 180, height: 180),
+            scale: NSScreen.main?.backingScaleFactor ?? 2.0,
+            representationTypes: .all
+        )
+        let hasAccess = item.url.startAccessingSecurityScopedResource()
+        QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { [weak self] thumbnail, _ in
+            DispatchQueue.main.async {
+                if hasAccess { item.url.stopAccessingSecurityScopedResource() }
+                if let cgImage = thumbnail?.cgImage {
+                    let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+                    self?.thumbnailCache.setObject(image, forKey: key)
+                    completion(image)
+                } else {
+                    self?.loadLargeIcon(for: item) { [weak self] icon in
+                        self?.thumbnailCache.setObject(icon, forKey: key)
+                        completion(icon)
+                    }
+                }
+            }
+        }
+    }
+
+    private func isArchiveURL(_ url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        let archiveExtensions: Set<String> = ["zip", "rar", "7z", "tar", "tgz", "gz", "bz2", "xz", "tbz2", "txz"]
+        return archiveExtensions.contains(ext)
+    }
+
+    private func loadArchivePreview(from archiveURL: URL) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let extractionURL = self.makeArchiveExtractionURL(for: archiveURL)
+            do {
+                let archiveSize = self.archiveByteSize(for: archiveURL)
+                try FileManager.default.createDirectory(at: extractionURL, withIntermediateDirectories: true)
+                let extractionResult: Result<Void, Error> = self.withSecurityScopedAccess(archiveURL) {
+                    do {
+                        try self.extractArchive(archiveURL, to: extractionURL)
+                        return .success(())
+                    } catch {
+                        return .failure(error)
+                    }
+                }
+                switch extractionResult {
+                case .success:
+                    break
+                case .failure(let error):
+                    throw error
+                }
+                self.activeArchiveExtractionURL = extractionURL
+
+                let contents = try FileManager.default.contentsOfDirectory(
+                    at: extractionURL,
+                    includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentTypeKey, .contentModificationDateKey],
+                    options: [.skipsHiddenFiles]
+                )
+                let sorted = self.sortURLs(contents)
+                var rootItems: [FileItem] = []
+                var totalSize: Int64 = 0
+                var folderCount = 0
+                var fileCount = 0
+
+                for entry in sorted.prefix(500) {
+                    let values = try entry.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .contentTypeKey, .contentModificationDateKey])
+                    let item = FileItem(url: entry, resourceValues: values)
+                    if item.isFolder {
+                        let children = self.makeDirectoryItems(at: item.url, parent: item, limit: 500)
+                        item.setChildren(children)
+                    }
+                    rootItems.append(item)
+                    if item.isFolder {
+                        folderCount += 1
+                    } else {
+                        fileCount += 1
+                        totalSize += item.size
+                    }
+                }
+                self.sortFileItems(&rootItems)
+                let displaySize = archiveSize > 0 ? archiveSize : totalSize
+                let infoText = "\(self.byteFormatter.string(fromByteCount: displaySize)) · \(folderCount) folders, \(fileCount) files (archive)"
+
+                DispatchQueue.main.async {
+                    guard self.previewRootURL == archiveURL else { return }
+                    self.gridContextItem = nil
+                    self.rootItems = rootItems
+                    self.rebuildVisibleRootItems()
+                    self.infoLabel.stringValue = infoText
+                    self.outlineView.reloadData()
+                    self.collectionView.reloadData()
+                    self.syncPreviewWithSelection()
+                }
+
+                DispatchQueue.global(qos: .utility).async {
+                    let recursive = self.recursiveStats(for: extractionURL, maxEntries: 50_000, timeBudget: 2.0)
+                    let recursiveDisplaySize = archiveSize > 0 ? archiveSize : recursive.totalSize
+                    let recursiveInfoText = "\(self.byteFormatter.string(fromByteCount: recursiveDisplaySize)) · \(recursive.folderCount) folders, \(recursive.fileCount) files (archive)"
+                    DispatchQueue.main.async {
+                        guard self.previewRootURL == archiveURL else { return }
+                        self.infoLabel.stringValue = recursiveInfoText
+                    }
+                }
+            } catch {
+                DebugLogger.shared.log("Archive preview failed for \(archiveURL.lastPathComponent): \(error.localizedDescription)")
+                DispatchQueue.main.async {
+                    guard self.previewRootURL == archiveURL else { return }
+                    self.gridContextItem = nil
+                    self.rootItems = []
+                    self.rebuildVisibleRootItems()
+                    self.outlineView.reloadData()
+                    self.collectionView.reloadData()
+                    self.infoLabel.stringValue = "Could not open archive."
+                    self.previewMessageLabel.stringValue = "Archive preview unavailable for this file."
+                    self.previewMessageLabel.isHidden = false
+                    self.updatePreview(for: nil)
+                }
+            }
+        }
+    }
+
+    private func archiveByteSize(for archiveURL: URL) -> Int64 {
+        let value: Int64 = withSecurityScopedAccess(archiveURL) {
+            let rv = try? archiveURL.resourceValues(forKeys: [.fileSizeKey])
+            return Int64(rv?.fileSize ?? 0)
+        }
+        return max(0, value)
+    }
+
+    private func makeArchiveExtractionURL(for archiveURL: URL) -> URL {
+        let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        let container = temp.appendingPathComponent("PeekXArchivePreview", isDirectory: true)
+        let name = archiveURL.deletingPathExtension().lastPathComponent
+        let unique = UUID().uuidString
+        return container.appendingPathComponent("\(name)-\(unique)", isDirectory: true)
+    }
+
+    private func makeDirectoryItems(at url: URL, parent: FileItem?, limit: Int) -> [FileItem] {
+        let contents = (try? FileManager.default.contentsOfDirectory(
+            at: url,
+            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentTypeKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+        var items: [FileItem] = []
+        for entry in sortURLs(contents).prefix(limit) {
+            let values = try? entry.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .contentTypeKey, .contentModificationDateKey])
+            guard let values else { continue }
+            items.append(FileItem(url: entry, resourceValues: values, parent: parent))
+        }
+        sortFileItems(&items)
+        return items
+    }
+
+    private func extractArchive(_ archiveURL: URL, to destinationURL: URL) throws {
+        let ext = archiveURL.pathExtension.lowercased()
+        if ext == "zip" {
+            try materializeZipIndex(from: archiveURL, to: destinationURL)
+            return
+        }
+
+        throw PreviewError.accessDenied
+    }
+
+    private func cleanupActiveArchiveExtraction() {
+        guard let url = activeArchiveExtractionURL else { return }
+        try? FileManager.default.removeItem(at: url)
+        activeArchiveExtractionURL = nil
+    }
+
+    private func materializeZipIndex(from archiveURL: URL, to destinationURL: URL) throws {
+        let data = try Data(contentsOf: archiveURL, options: [.mappedIfSafe])
+        guard let entries = parseZipEntries(from: data), !entries.isEmpty else {
+            throw PreviewError.accessDenied
+        }
+
+        // Materialize a safe virtual tree (dirs + empty files) for archive browsing.
+        let manager = FileManager.default
+        var createdDirectories = Set<String>()
+        let limit = 10_000
+        var processed = 0
+
+        for rawPath in entries {
+            if processed >= limit { break }
+            guard let safePath = sanitizedArchiveRelativePath(rawPath) else { continue }
+            let destination = destinationURL.appendingPathComponent(safePath)
+
+            if rawPath.hasSuffix("/") {
+                if createdDirectories.insert(safePath).inserted {
+                    try manager.createDirectory(at: destination, withIntermediateDirectories: true)
+                }
+            } else {
+                let parent = destination.deletingLastPathComponent()
+                try manager.createDirectory(at: parent, withIntermediateDirectories: true)
+                _ = manager.createFile(atPath: destination.path, contents: nil)
+            }
+            processed += 1
+        }
+    }
+
+    private func parseZipEntries(from data: Data) -> [String]? {
+        let eocdSignature: UInt32 = 0x06054b50
+        let cdfhSignature: UInt32 = 0x02014b50
+        let minEOCDSize = 22
+        guard data.count >= minEOCDSize else { return nil }
+
+        let maxComment = 65_535
+        let searchStart = max(0, data.count - (minEOCDSize + maxComment))
+        var eocdOffset: Int?
+        if data.count >= 4 {
+            for i in stride(from: data.count - 4, through: searchStart, by: -1) {
+                guard let sig = readUInt32LE(data, at: i) else { continue }
+                if sig == eocdSignature {
+                    eocdOffset = i
+                    break
+                }
+            }
+        }
+        guard let eocd = eocdOffset else { return nil }
+
+        guard
+            let totalEntries = readUInt16LE(data, at: eocd + 10),
+            let centralDirSize = readUInt32LE(data, at: eocd + 12),
+            let centralDirOffset = readUInt32LE(data, at: eocd + 16)
+        else {
+            return nil
+        }
+
+        var cursor = Int(centralDirOffset)
+        let end = min(data.count, Int(centralDirOffset) + Int(centralDirSize))
+        var names: [String] = []
+        names.reserveCapacity(Int(totalEntries))
+
+        while cursor + 46 <= end {
+            guard let sig = readUInt32LE(data, at: cursor), sig == cdfhSignature else { break }
+            guard
+                let fileNameLength = readUInt16LE(data, at: cursor + 28),
+                let extraLength = readUInt16LE(data, at: cursor + 30),
+                let commentLength = readUInt16LE(data, at: cursor + 32)
+            else {
+                break
+            }
+
+            let nameStart = cursor + 46
+            let nameEnd = nameStart + Int(fileNameLength)
+            guard nameEnd <= data.count else { break }
+
+            let nameData = data.subdata(in: nameStart..<nameEnd)
+            let name = String(data: nameData, encoding: .utf8)
+                ?? String(data: nameData, encoding: .isoLatin1)
+                ?? ""
+            if !name.isEmpty {
+                names.append(name)
+            }
+
+            let step = 46 + Int(fileNameLength) + Int(extraLength) + Int(commentLength)
+            if step <= 0 { break }
+            cursor += step
+        }
+
+        return names
+    }
+
+    private func readUInt16LE(_ data: Data, at offset: Int) -> UInt16? {
+        guard offset >= 0, offset + 2 <= data.count else { return nil }
+        return data.withUnsafeBytes { raw -> UInt16 in
+            let p = raw.baseAddress!.advanced(by: offset).assumingMemoryBound(to: UInt8.self)
+            return UInt16(p[0]) | (UInt16(p[1]) << 8)
+        }
+    }
+
+    private func readUInt32LE(_ data: Data, at offset: Int) -> UInt32? {
+        guard offset >= 0, offset + 4 <= data.count else { return nil }
+        return data.withUnsafeBytes { raw -> UInt32 in
+            let p = raw.baseAddress!.advanced(by: offset).assumingMemoryBound(to: UInt8.self)
+            return UInt32(p[0]) | (UInt32(p[1]) << 8) | (UInt32(p[2]) << 16) | (UInt32(p[3]) << 24)
+        }
+    }
+
+    private func sanitizedArchiveRelativePath(_ rawPath: String) -> String? {
+        var path = rawPath.replacingOccurrences(of: "\\", with: "/")
+        while path.hasPrefix("/") {
+            path.removeFirst()
+        }
+        let pieces = path.split(separator: "/").map(String.init)
+        if pieces.isEmpty { return nil }
+        if pieces.first == "__MACOSX" { return nil }
+        let safePieces = pieces.filter { !$0.isEmpty && $0 != "." && $0 != ".." }
+        if safePieces.isEmpty { return nil }
+        if safePieces.last == ".DS_Store" { return nil }
+        if safePieces.last?.hasPrefix("._") == true { return nil }
+        return safePieces.joined(separator: "/")
+    }
     
     private func withSecurityScopedAccess<T>(_ url: URL, block: () -> T) -> T {
         let hasAccess = url.startAccessingSecurityScopedResource()
@@ -1833,6 +2532,8 @@ extension PreviewViewController: NSOutlineViewDelegate {
     
     func outlineView(_ outlineView: NSOutlineView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
         currentSortDescriptor = outlineView.sortDescriptors.first
+        sortKeyControl.selectedSegment = segment(forSortKey: currentSortDescriptor?.key)
+        sortOrderControl.selectedSegment = (currentSortDescriptor?.ascending ?? true) ? 0 : 1
         
         // Move sorting to background thread to avoid blocking UI
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -1845,6 +2546,7 @@ extension PreviewViewController: NSOutlineViewDelegate {
                 self.rebuildVisibleRootItems()
                 // Use targeted reload instead of full reloadData()
                 self.outlineView.reloadItem(nil, reloadChildren: true)
+                self.collectionView.reloadData()
             }
         }
     }
@@ -1861,6 +2563,53 @@ extension PreviewViewController: NSOutlineViewDelegate {
         guard notification.object as? NSOutlineView === outlineView else { return }
         // Removed logging here to reduce overhead on every selection change
         syncPreviewWithSelection()
+    }
+}
+
+extension PreviewViewController: NSCollectionViewDataSource, NSCollectionViewDelegate {
+    func numberOfSections(in collectionView: NSCollectionView) -> Int { 1 }
+
+    func collectionView(_ collectionView: NSCollectionView, numberOfItemsInSection section: Int) -> Int {
+        currentGridItems.count
+    }
+
+    func collectionView(_ collectionView: NSCollectionView, itemForRepresentedObjectAt indexPath: IndexPath) -> NSCollectionViewItem {
+        let itemView = collectionView.makeItem(withIdentifier: FinderGridItem.identifier, for: indexPath)
+        guard
+            let gridItem = itemView as? FinderGridItem,
+            indexPath.item < currentGridItems.count
+        else {
+            return itemView
+        }
+
+        let model = currentGridItems[indexPath.item]
+        gridItem.textField?.stringValue = model.name
+        gridItem.representedObject = model.url.path
+        gridItem.imageView?.image = NSWorkspace.shared.icon(forFile: model.url.path)
+
+        loadGridThumbnail(for: model) { [weak gridItem] image in
+            guard let gridItem else { return }
+            guard (gridItem.representedObject as? String) == model.url.path else { return }
+            gridItem.imageView?.image = image
+        }
+        return gridItem
+    }
+
+    func collectionView(_ collectionView: NSCollectionView, didSelectItemsAt indexPaths: Set<IndexPath>) {
+        syncPreviewWithSelection()
+    }
+
+    func collectionView(_ collectionView: NSCollectionView, didDeselectItemsAt indexPaths: Set<IndexPath>) {
+        syncPreviewWithSelection()
+    }
+
+    func collectionView(_ collectionView: NSCollectionView, didDoubleClickItemsAt indexPaths: Set<IndexPath>) {
+        guard let index = indexPaths.first?.item else { return }
+        let items = currentGridItems
+        guard index < items.count else { return }
+        let item = items[index]
+        guard item.isFolder else { return }
+        enterGridFolder(item)
     }
 }
 
@@ -1883,7 +2632,16 @@ extension PreviewViewController: NSMenuDelegate {
 }
 
 extension PreviewViewController: NSSplitViewDelegate {
+    func splitView(_ splitView: NSSplitView, constrainSplitPosition proposedPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
+        let minLeft: CGFloat = 280
+        let minRight: CGFloat = currentViewMode == .fullList ? 0 : 340
+        let maxLeft = max(minLeft, splitView.bounds.width - minRight)
+        return min(max(proposedPosition, minLeft), maxLeft)
+    }
+
     func splitViewDidResizeSubviews(_ notification: Notification) {
+        guard currentViewMode == .list else { return }
+        guard !isApplyingSplitRatio else { return }
         guard splitView.bounds.width > 0, splitView.subviews.count >= 2 else { return }
         let leftWidth = splitView.subviews[0].frame.width
         let ratio = max(0.2, min(0.8, leftWidth / splitView.bounds.width))
@@ -1908,7 +2666,30 @@ extension PreviewViewController: FinderOutlineViewKeyboardDelegate {
         let commandPressed = event.modifierFlags.contains(.command)
         switch (event.keyCode, commandPressed) {
         case (49, false): // Space
-            showQuickLook()
+            // Space shortcut intentionally disabled.
+            return true
+        case (_, true) where event.charactersIgnoringModifiers == "c":
+            copyPathAction()
+            return true
+        default:
+            return false
+        }
+    }
+}
+
+extension PreviewViewController: FinderCollectionViewKeyboardDelegate {
+    func collectionView(_ collectionView: FinderCollectionView, handle event: NSEvent) -> Bool {
+        let commandPressed = event.modifierFlags.contains(.command)
+        switch (event.keyCode, commandPressed) {
+        case (49, false): // Space
+            // Space shortcut intentionally disabled.
+            return true
+        case (36, false), (76, false): // Return / Enter
+            guard let item = selectedItems.last, item.isFolder else { return false }
+            enterGridFolder(item)
+            return true
+        case (51, false), (117, false): // Delete / Forward Delete
+            exitGridFolder()
             return true
         case (_, true) where event.charactersIgnoringModifiers == "c":
             copyPathAction()
